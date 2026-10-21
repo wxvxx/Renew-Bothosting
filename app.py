@@ -120,16 +120,46 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     return "\n".join(lines)
 
 # ---------- 基础工具 ----------
-def js(sb, script, default=None):
+def js(sb, script, default=None, errors=None):
     try:
         result = sb.execute_script(script)
         return default if result is None else result
-    except Exception:
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"execute_script: {type(e).__name__}: {e}")
         try:
             result = sb.cdp.evaluate("(function(){ " + script + " })()")
             return default if result is None else result
-        except Exception:
+        except Exception as e2:
+            if errors is not None:
+                errors.append(f"cdp.evaluate: {type(e2).__name__}: {e2}")
             return default
+
+# Turnstile 定位失败时的现场诊断快照
+def diag_turnstile_dom(sb, errors=None):
+    snap = js(sb, """
+        var out = [];
+        var ifr = document.querySelectorAll('iframe');
+        out.push('top-doc iframes: ' + ifr.length);
+        for (var i = 0; i < ifr.length; i++) {
+            var r = ifr[i].getBoundingClientRect();
+            out.push('iframe w=' + Math.round(r.width) + ' h=' + Math.round(r.height) + ' src=' + (ifr[i].src || '').slice(0, 90));
+        }
+        var ts = document.querySelectorAll('[class*="turnstile"], [id*="turnstile"], input[name="cf-turnstile-response"]');
+        out.push('turnstile-ish elements: ' + ts.length);
+        for (var j = 0; j < ts.length; j++) {
+            var rr = ts[j].getBoundingClientRect();
+            var cls = (typeof ts[j].className === 'string') ? ts[j].className : (ts[j].getAttribute('class') || '');
+            out.push(' - ' + ts[j].tagName + ' class=' + cls + ' w=' + Math.round(rr.width) + ' h=' + Math.round(rr.height));
+        }
+        out.push('window.turnstile=' + (typeof window.turnstile) + ' readyState=' + document.readyState);
+        return out.join('\\n');
+    """, "")
+    for line in str(snap).splitlines():
+        print("   [diag] " + line)
+    if errors:
+        for err in errors:
+            print("   [diag][exec-error] " + str(err)[:200])
 
 #  页面注入脚本
 # Turnstile token（官方 JS 接口 或 表单隐藏域），未通过时为空串
@@ -140,12 +170,42 @@ var el = document.querySelector('input[name="cf-turnstile-response"]');
 return el ? (el.value || '') : '';
 """
 
-# 注意: execute_script 以函数体方式执行脚本, 必须用顶层 return;
-# IIFE 写法 (function(){...})() 不加 return 时返回 None, 会导致永远误判"未检测到 Turnstile"
 TURNSTILE_EXISTS_JS = """
 return document.querySelector(
     'input[name="cf-turnstile-response"], iframe[src*="challenges.cloudflare.com"], .cf-turnstile'
 ) !== null;
+"""
+TS_COORDS_JS = """
+function findWidget(root) {
+    var els = root.querySelectorAll(
+        'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [id*="cf-chl"]');
+    for (var i = 0; i < els.length; i++) {
+        var r = els[i].getBoundingClientRect();
+        if (r.width > 50 && r.height > 20) return els[i];
+    }
+    var all = root.querySelectorAll('*');
+    for (var j = 0; j < all.length; j++) {
+        if (all[j].shadowRoot) {
+            var f = findWidget(all[j].shadowRoot);
+            if (f) return f;
+        }
+    }
+    return null;
+}
+function boxFromTokenInput() {
+    var el = document.querySelector('input[name="cf-turnstile-response"]');
+    var cur = el ? el.parentElement : null;
+    for (var k = 0; k < 6 && cur; k++) {
+        var r = cur.getBoundingClientRect();
+        if (r.width > 100 && r.width < 600 && r.height > 30 && r.height < 140) return cur;
+        cur = cur.parentElement;
+    }
+    return null;
+}
+var hit = findWidget(document) || boxFromTokenInput();
+if (!hit) return null;
+var hr = hit.getBoundingClientRect();
+return {cx: Math.round(hr.x + 30), cy: Math.round(hr.y + hr.height / 2)};
 """
 
 # Turnstile 脚本异步渲染，轮询等待组件出现
@@ -204,33 +264,18 @@ def turnstile_token(sb) -> str:
     token = js(sb, TURNSTILE_TOKEN_JS, "")
     return token if isinstance(token, str) else ""
 
-TS_COORDS_JS = """
-var frames = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]');
-for (var i = 0; i < frames.length; i++) {
-    var r = frames[i].getBoundingClientRect();
-    if (r.width > 50 && r.height > 20)
-        return {cx: Math.round(r.x + 30), cy: Math.round(r.y + r.height / 2)};
-}
-var box = document.querySelector('.cf-turnstile');
-if (box) {
-    var r = box.getBoundingClientRect();
-    if (r.width > 50 && r.height > 20)
-        return {cx: Math.round(r.x + 27), cy: Math.round(r.y + 29)};
-}
-return null;
-"""
-
-def _click_turnstile(sb, locate_timeout=6) -> bool:
-    # Turnstile iframe 是异步渲染的, 轮询等待几秒再定位坐标
+def _click_turnstile(sb, locate_timeout=10) -> bool:
     coords = None
+    errors = []
     deadline = time.time() + locate_timeout
     while time.time() < deadline:
-        coords = js(sb, TS_COORDS_JS)
+        coords = js(sb, TS_COORDS_JS, None, errors)
         if coords:
             break
         time.sleep(1)
     if not coords:
-        print("⚠️ 无法定位 Turnstile 坐标")
+        print("⚠️ 无法定位 Turnstile 坐标, 打印现场诊断:")
+        diag_turnstile_dom(sb, errors)
         return False
 
     try:
@@ -263,7 +308,7 @@ def click_turnstile(sb) -> bool:
             print(f"⚠️ 坐标点击失败: {e}")
     try:
         if hasattr(sb, "cdp") and hasattr(sb.cdp, "click_captcha"):
-            print("🖱️ 兜底调用 sb.cdp.click_captcha() ...")
+            print("🖱️ 兜底调用cdp点击 ...")
             sb.cdp.click_captcha()
             return True
         print("⚠️ 当前 SeleniumBase 版本无 sb.cdp.click_captcha")
@@ -274,13 +319,13 @@ def click_turnstile(sb) -> bool:
 def solve_turnstile(sb, timeout=90, tag="Turnstile", first_wait=8) -> bool:
     if turnstile_token(sb):
         return True
-    print(f"🛡️ 处理 {tag}：先等 {first_wait} 秒自动验证...")
+
     deadline = time.time() + timeout
     next_click = time.time() + first_wait
     clicks = 0
     while time.time() < deadline:
         if turnstile_token(sb):
-            print(f"✅ {tag}已通过（已获取 token）")
+            print(f"✅ {tag}已通过(已获取 token)")
             return True
         if time.time() >= next_click:
             clicks += 1
@@ -364,7 +409,6 @@ def main():
     PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
 
-    # 强制英文界面: 该站按浏览器语言渲染不同文案, 中文 UI 会使英文文案匹配全部失效
     sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
 
     if IS_PROXY:
@@ -386,74 +430,86 @@ def main():
 
         # 方式1: SESSION_TOKEN Cookie 登录（默认）
         if SESSION_TOKEN:
-            print("🚀 启动浏览器...")
-            sb.open(f"{BASE_URL}")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(2)
+            try:
+                print("🚀 启动浏览器...")
+                sb.open(f"{BASE_URL}")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(2)
 
-            print("📝 注入 Cookie...")
-            for name, value in COOKIES.items():
-                if value:
-                    sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
+                print("📝 注入 Cookie...")
+                for name, value in COOKIES.items():
+                    if value:
+                        sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
 
-            print("🌐 访问 https://bot-hosting.net/a/billings ...")
-            sb.open(f"{BASE_URL}/a/billings")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(3)
-            current_url = sb.get_current_url()
-            current_title = sb.get_title()
-            print(f"📝 当前URL: {current_url}, Title: {current_title}")
+                print("🌐 访问 https://bot-hosting.net/a/billings ...")
+                sb.open(f"{BASE_URL}/a/billings")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                current_url = sb.get_current_url()
+                current_title = sb.get_title()
+                print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-            if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
-                login_ok = True
-                print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
-            else:
-                print(f"❌ SESSION_TOKEN 登录失败,当前URL: {current_url}, 当前标题: {current_title}")
+                if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
+                    login_ok = True
+                    print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
+                else:
+                    print(f"❌ SESSION_TOKEN 登录失败,当前URL: {current_url}, 当前标题: {current_title}")
+            except Exception as e:
+                print(f"❌ SESSION_TOKEN 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
 
-        # 方式2: 密码
+        # 方式2: 密码 
         if not login_ok and EMAIL and PASSWORD:
             _LOGIN_METHOD = "Password"
             print("\n🔄 尝试密码登录...")
-            print(f"🌐 访问 {BASE_URL}/login")
-            sb.open(f"{BASE_URL}/login")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(3)
-            sb.click('button[type="submit"]') # 点击 Continue with email 按钮
-            sb.sleep(12)  # 等待页面加载
-            print(f"📧 填写邮箱...")
-            sb.input('input[type="email"]', EMAIL)
-            sb.sleep(1)
-            print(f"🔑 填写密码...")
-            sb.input('input[type="password"]', PASSWORD)
-            sb.sleep(3)
-
-            if wait_turnstile_present(sb):
-                if not handle_turnstile(sb):
-                    print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
+            try:
+                # 清掉可能残留的失效会话 cookie, 否则 /login 可能被重定向回账单页, 表单按钮找不到
+                for cookie_name in ("session_token", "login"):
                     try:
-                        sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
-                        sb.sleep(4)
-                    except Exception as e:
-                        print(f"⚠️ 兜底点击失败: {e}")
-                    # sb.save_screenshot("turnstile_failed.png")
-            else:
-                print("ℹ️ 未检测到 Turnstile")
-            sb.sleep(1)
-            sb.click('button[type="submit"]') # 点击登录按钮
-            sb.sleep(6)  # 等待页面加载
-            sb.wait_for_ready_state_complete()
-            sb.open(f"{BASE_URL}/a/billings")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(3)
-            current_url = sb.get_current_url()
-            current_title = sb.get_title()
-            print(f"📝 当前URL: {current_url}, Title: {current_title}")
+                        sb.delete_cookie(cookie_name)
+                    except Exception:
+                        pass
+                print(f"🌐 访问 {BASE_URL}/login")
+                sb.open(f"{BASE_URL}/login")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                sb.click('button[type="submit"]') # 点击 Continue with email 按钮
+                sb.sleep(12)  # 等待页面加载
+                print(f"📧 填写邮箱...")
+                sb.input('input[type="email"]', EMAIL)
+                sb.sleep(1)
+                print(f"🔑 填写密码...")
+                sb.input('input[type="password"]', PASSWORD)
+                sb.sleep(3)
 
-            if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
-                login_ok = True
-                print("✅ Password 登录成功,当前已到达账单页")
-            else:
-                print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
+                if wait_turnstile_present(sb):
+                    if not handle_turnstile(sb):
+                        print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
+                        try:
+                            sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
+                            sb.sleep(4)
+                        except Exception as e:
+                            print(f"⚠️ 兜底点击失败: {e}")
+                        # sb.save_screenshot("turnstile_failed.png")
+                else:
+                    print("ℹ️ 未检测到 Turnstile")
+                sb.sleep(1)
+                sb.click('button[type="submit"]') # 点击登录按钮
+                sb.sleep(6)  # 等待页面加载
+                sb.wait_for_ready_state_complete()
+                sb.open(f"{BASE_URL}/a/billings")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                current_url = sb.get_current_url()
+                current_title = sb.get_title()
+                print(f"📝 当前URL: {current_url}, Title: {current_title}")
+
+                if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
+                    login_ok = True
+                    print("✅ Password 登录成功,当前已到达账单页")
+                else:
+                    print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
+            except Exception as e:
+                print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
 
         if not login_ok:
             error_msg = "Cookie 已失效或页面异常"
@@ -494,12 +550,13 @@ def main():
             try:
                 if sb.is_element_visible(selector):
                     button_text = sb.get_text(selector)
-                    if "Renew in" in button_text:
-                        match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", button_text)
-                        if match:
-                            countdown_text = match.group(1)
+                    # "Renew in HH:MM:SS" / "Renewal cooldown HH:MM:SS" 都表示冷却中, 时间为距可续期的剩余时长
+                    match = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", button_text, re.I)
+                    if match:
+                        countdown_text = match.group(1)
+                        print(f"⏳ 续期冷却中, 未到续期时间: '{button_text}'")
                         break
-                    elif "Renew" in button_text and "in" not in button_text.lower():
+                    elif "Renew" in button_text:
                         outer_renew_selector = selector
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
